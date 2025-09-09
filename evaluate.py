@@ -1,80 +1,128 @@
+import os
 import numpy as np
 import pandas as pd
-import re, os, time
-from string import printable
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, confusion_matrix
-
-import tensorflow as tf
-from keras.layers import *
-from keras import backend as K
-from keras.optimizers import Adam
-from tensorflow.keras import layers
+import matplotlib.pyplot as plt
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    accuracy_score,
+    roc_curve,
+    auc
+)
+from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing import sequence
-from keras.models import Sequential, Model, load_model
-from keras.callbacks import EarlyStopping, ModelCheckpoint
-from keras.layers.convolutional import Conv1D, MaxPooling1D
-from keras.layers.core import Dense, Dropout, Activation, Lambda, Flatten
 
-def create_scaler(df):
-    # apply standard scaler
-    html_len = df[['html_length']].values.astype(float)
-    n_hyperlinks = df[['n_hyperlinks']].values.astype(float)
-    n_script_tag = df[['n_script_tag']].values.astype(float)
-    n_link_tag = df[['n_link_tag']].values.astype(float)
-    n_comment_tag = df[['n_comment_tag']].values.astype(float)
+# ===== CONFIG =====
+DATA_PATH = "features/all_data.csv"   # must have url,label
+MODEL_PATHS = {
+    "CNN": "models/model_CNN_LSTM.h5",
+    "RNN": "models/model_RNN_LSTM.h5",
+    "Hybrid": "models/model_CNN_RNN_LSTM_Hybrid.h5"
+}
+OUTPUT_DIR = "evaluation_results"
+MAX_LEN = 150    # adjust based on training
 
-    scaler = StandardScaler()
-    html_len_scaled = scaler.fit_transform(html_len)
-    n_hyperlinks_scaled = scaler.fit_transform(n_hyperlinks)
-    n_script_tag_scaled = scaler.fit_transform(n_script_tag)
-    n_link_tag_scaled = scaler.fit_transform(n_link_tag)
-    n_comment_tag_scaled = scaler.fit_transform(n_comment_tag)
+# ===== PREPROCESS =====
+def preprocess_urls(urls):
+    # simple char-level tokenizer (turn each char into int)
+    char_dict = {c: i + 1 for i, c in enumerate(sorted(set("".join(urls))))}
+    url_int_tokens = [[char_dict.get(ch, 0) for ch in url] for url in urls]
+    return sequence.pad_sequences(url_int_tokens, maxlen=MAX_LEN)
 
-    # remove column and add to data frame
-    df = pd.concat([df.drop(columns=['html_length','n_hyperlinks','n_script_tag','n_link_tag','n_comment_tag']),
-                    pd.DataFrame(html_len_scaled, columns=['html_length_std']),
-                    pd.DataFrame(n_hyperlinks_scaled, columns=['n_hyperlinks_std']),
-                    pd.DataFrame(n_script_tag_scaled, columns=['n_script_tag_std']),
-                    pd.DataFrame(n_link_tag_scaled, columns=['n_link_tag_std']),
-                    pd.DataFrame(n_comment_tag_scaled, columns=['n_comment_tag_std'])], axis=1, join='inner')
+# ===== LOAD DATA =====
+def load_data():
+    if not os.path.exists(DATA_PATH):
+        raise FileNotFoundError(f"❌ Cannot find data file: {DATA_PATH}")
+    df = pd.read_csv(DATA_PATH)
+    if "url" not in df.columns or "label" not in df.columns:
+        raise ValueError("❌ all_data.csv must have 'url' and 'label' columns.")
+    urls = df["url"].astype(str).tolist()
+    labels = df["label"].map({"Legitimate": 0, "Phishing": 1}).values
+    return urls, labels
 
-    return df
+# ===== EVALUATE + SAVE =====
+def evaluate_and_plot(name, model, X, y_true):
+    print(f"\n=== Evaluating {name} ===")
+    y_pred_probs = model.predict(X)
+    y_pred = (y_pred_probs > 0.5).astype("int32").flatten()
 
-def create_X_1(temp_X_1):
-    url_int_tokens = [[printable.index(x) + 1 for x in url if x in printable] for url in temp_X_1.url]
-    max_len=150
-    X_new_1 = sequence.pad_sequences(url_int_tokens, maxlen=max_len)
-    return X_new_1
+    acc = accuracy_score(y_true, y_pred)
+    print(f"Accuracy: {acc:.4f}")
 
-def create_X_2(temp_X_2):
-    # input (x) variables
-    x = temp_X_2.drop(columns=['url']).values.astype(float)
+    # Classification report
+    report = classification_report(
+        y_true, y_pred, target_names=["Legitimate", "Phishing"]
+    )
+    print(report)
 
-    # reshape input (x)
-    X_new_2 = x.reshape(x.shape[0], x.shape[1], 1)
-    return X_new_2
+    # Confusion matrix
+    cm = confusion_matrix(y_true, y_pred)
 
-def predict_classes(model, x):
-    proba = model.predict(x)
-    if proba.shape[-1] > 1:
-        return proba.argmax(axis=-1)
-    else:
-        return (proba > 0.5).astype('int32')
+    # ROC curve
+    fpr, tpr, _ = roc_curve(y_true, y_pred_probs)
+    roc_auc = auc(fpr, tpr)
 
-# data load
-legitimate_test = pd.read_csv('features/legitimate_test.csv')
-phish_test = pd.read_csv('features/phish_test.csv')
+    # Create output folder for this model
+    model_dir = os.path.join(OUTPUT_DIR, name)
+    os.makedirs(model_dir, exist_ok=True)
 
-test = create_scaler(pd.concat([legitimate_test, phish_test], axis=0)).sample(frac=1).reset_index(drop=True)
-X_test, y_test = test.drop(columns=['result_flag']), test.result_flag
-print(y_test)
+    # Save report
+    with open(os.path.join(model_dir, "classification_report.txt"), "w") as f:
+        f.write(report)
 
-# load the saved model
-model = load_model('models/model_C.h5')
+    # Plot and save confusion matrix
+    plt.figure(figsize=(4, 4))
+    plt.imshow(cm, cmap="Blues")
+    plt.title(f"{name} Confusion Matrix")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.xticks([0, 1], ["Legitimate", "Phishing"])
+    plt.yticks([0, 1], ["Legitimate", "Phishing"])
+    for i in range(2):
+        for j in range(2):
+            plt.text(j, i, cm[i, j], ha="center", va="center", color="red")
+    plt.tight_layout()
+    plt.savefig(os.path.join(model_dir, "confusion_matrix.png"))
+    plt.close()
 
-# evalaute model performance
-y_pred = predict_classes(model, [create_X_1(X_test),create_X_2(X_test)])
-print(confusion_matrix(y_test, y_pred))
+    # Plot and save ROC curve
+    plt.figure()
+    plt.plot(fpr, tpr, color='blue', lw=2, label=f'AUC = {roc_auc:.2f}')
+    plt.plot([0, 1], [0, 1], color='gray', lw=2, linestyle='--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f"{name} ROC Curve")
+    plt.legend(loc="lower right")
+    plt.savefig(os.path.join(model_dir, "roc_curve.png"))
+    plt.close()
 
-print("All done.")
+    return {"accuracy": acc, "auc": roc_auc, "report": report, "cm": cm}
+
+# ===== MAIN =====
+if __name__ == "__main__":
+    urls, labels = load_data()
+    X = preprocess_urls(urls)
+
+    results_summary = []
+
+    for name, path in MODEL_PATHS.items():
+        if not os.path.exists(path):
+            print(f"⚠️ Model file for {name} not found at {path}. Skipping...")
+            continue
+        model = load_model(path)
+        metrics = evaluate_and_plot(name, model, X, labels)
+        results_summary.append({
+            "Model": name,
+            "Accuracy": metrics["accuracy"],
+            "AUC": metrics["auc"]
+        })
+
+    # Save summary
+    if results_summary:
+        summary_df = pd.DataFrame(results_summary)
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        summary_df.to_csv(os.path.join(OUTPUT_DIR, "summary.csv"), index=False)
+
+    print("\n=== Summary ===")
+    for row in results_summary:
+        print(f"{row['Model']}: Accuracy={row['Accuracy']:.4f}, AUC={row['AUC']:.4f}")
